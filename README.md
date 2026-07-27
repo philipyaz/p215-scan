@@ -32,19 +32,18 @@ export a searchable PDF — in one window instead of a three-step wizard.
 With [Homebrew](https://brew.sh) (installs the SANE backend too):
 
 ```bash
-HOMEBREW_CASK_OPTS=--no-quarantine brew install --cask philipyaz/tap/p215-scan
+brew install --cask philipyaz/tap/p215-scan
 ```
-
-(Homebrew 6 removed `--no-quarantine` as a command-line flag; the environment
-variable form works on every Homebrew version.)
 
 Or by hand: grab the zip from
 [Releases](https://github.com/philipyaz/p215-scan/releases), drop
 `P215 Scan.app` into `/Applications`, and `brew install sane-backends`.
 Releases are not notarized (there is no paid Apple Developer account behind
-this project); without the no-quarantine option macOS will refuse the first
-launch until you allow it under **System Settings → Privacy & Security →
-Open Anyway**.
+this project). Homebrew 6 installs it ready to launch; if you downloaded the
+zip by hand — or use an older Homebrew, where you can add
+`HOMEBREW_CASK_OPTS=--no-quarantine` — macOS may refuse the first launch
+until you allow it under **System Settings → Privacy & Security → Open
+Anyway**.
 
 Or build from source — it is one `swiftc` invocation, no Xcode project:
 
