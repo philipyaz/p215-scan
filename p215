@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""
+p215 -- a usable scanning tool for the Canon imageFORMULA P-215 / P-215II on macOS.
+
+Canon's own "CaptureOnTouch Lite" is an x86_64 app from 2019 that only runs under
+Rosetta and only works while the scanner pretends to be a USB flash drive.  This
+replaces it: it drives the scanner through SANE's canon_dr backend, which is
+native, maintained, and gives real control over resolution, duplex and colour.
+
+Subcommands
+    p215 doctor            diagnose USB mode / SANE install and say exactly what to fix
+    p215 scan [options]    scan from the ADF and write a PDF (or TIFF/JPEG/PNG)
+
+No third-party Python packages are required -- PDFs are assembled by embedding
+JPEGs directly, and `sips` (built into macOS) does the image conversion.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+SCANIMAGE = shutil.which("scanimage") or "/opt/homebrew/bin/scanimage"
+CANON_VID = 0x1083
+
+# PIDs where the scanner presents a real scanner interface (canon_dr can drive it).
+SCANNER_MODE = {
+    0x1641: "DR-P215",
+    0x1646: "P-215",
+    0x1659: "DR-P215II",
+    0x165B: "P-215II",
+    0x164C: "P-208",
+    0x165F: "P-208II",
+    0x162C: "P-150",
+}
+
+# PIDs where the scanner is in "Auto Start ON" / CaptureOnTouch Lite mode and
+# enumerates as USB mass storage.  In this mode macOS's own storage driver owns
+# the USB interface, so no userspace scanner driver can claim it.
+STORAGE_MODE = {
+    0x1647: "P-215",
+    0x165C: "P-215II",
+    0x1660: "P-208II",
+    0x164E: "P-208",
+    0x162D: "P-150",
+}
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+DIM = "\033[2m"
+
+
+def c(text, colour):
+    return text if not sys.stdout.isatty() else f"{colour}{text}{RESET}"
+
+
+# --------------------------------------------------------------------------
+# USB inspection
+# --------------------------------------------------------------------------
+
+def usb_canon_devices():
+    """Return [(pid, product_name)] for every Canon (VID 0x1083) device attached."""
+    try:
+        out = subprocess.run(
+            ["ioreg", "-p", "IOUSB", "-w0", "-l"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+    except Exception:
+        return []
+
+    found = []
+    # ioreg prints one property per line; walk it keeping the most recent name.
+    name = None
+    pid = None
+    vid = None
+    for line in out.splitlines():
+        m = re.search(r'"USB Product Name" = "([^"]*)"', line)
+        if m:
+            name = m.group(1)
+        m = re.search(r'"idProduct" = (\d+)', line)
+        if m:
+            pid = int(m.group(1))
+        m = re.search(r'"idVendor" = (\d+)', line)
+        if m:
+            vid = int(m.group(1))
+            if vid == CANON_VID and pid is not None:
+                found.append((pid, (name or "").strip()))
+            pid = None
+            name = None
+    return found
+
+
+# --------------------------------------------------------------------------
+# SANE helpers
+# --------------------------------------------------------------------------
+
+def sane_devices():
+    if not os.path.exists(SCANIMAGE):
+        return []
+    try:
+        out = subprocess.run([SCANIMAGE, "-L"], capture_output=True, text=True, timeout=60).stdout
+    except Exception:
+        return []
+    return re.findall(r"device `([^']+)'", out)
+
+
+def sane_options(device):
+    """Set of option names ('--mode', '--resolution', ...) the backend advertises."""
+    try:
+        out = subprocess.run(
+            [SCANIMAGE, "-d", device, "--help"],
+            capture_output=True, text=True, timeout=60,
+        ).stdout
+    except Exception:
+        return set(), ""
+    return set(re.findall(r"^\s+(--[a-zA-Z0-9-]+)", out, re.M)), out
+
+
+def option_values(help_text, option):
+    """Extract the allowed-values blob for an option from scanimage --help output."""
+    m = re.search(rf"^\s+{re.escape(option)}\s+(.*)$", help_text, re.M)
+    return m.group(1) if m else ""
+
+
+# --------------------------------------------------------------------------
+# doctor
+# --------------------------------------------------------------------------
+
+def cmd_doctor(args):
+    print(c("\np215 doctor", BOLD))
+    print("=" * 60)
+
+    ok = True
+
+    # 1. SANE present?
+    print(c("\n1. SANE backend", BOLD))
+    if os.path.exists(SCANIMAGE):
+        ver = subprocess.run([SCANIMAGE, "-V"], capture_output=True, text=True).stdout.strip()
+        print(f"   {c('OK', GREEN)}  {SCANIMAGE}")
+        print(f"       {c(ver, DIM)}")
+    else:
+        ok = False
+        print(f"   {c('MISSING', RED)}  scanimage not found")
+        print("       Fix:  brew install sane-backends")
+
+    # 2. USB
+    print(c("\n2. Scanner on USB", BOLD))
+    devs = usb_canon_devices()
+    if not devs:
+        ok = False
+        print(f"   {c('NOT FOUND', RED)}  no Canon (VID 0x1083) device attached")
+        print("       Check the USB cable; the P-215 is bus-powered so use a")
+        print("       direct port or a powered hub.")
+        return 1 if not ok else 0
+
+    storage_mode_hit = None
+    scanner_mode_hit = None
+    for pid, name in devs:
+        label = name or "?"
+        if pid in SCANNER_MODE:
+            scanner_mode_hit = (pid, SCANNER_MODE[pid])
+            print(f"   {c('OK', GREEN)}  {label}  (0x{CANON_VID:04x}:0x{pid:04x}) -- scanner mode")
+        elif pid in STORAGE_MODE:
+            storage_mode_hit = (pid, STORAGE_MODE[pid])
+            print(f"   {c('WRONG MODE', YELLOW)}  {label}  (0x{CANON_VID:04x}:0x{pid:04x})")
+        else:
+            print(f"   {c('?', YELLOW)}  {label}  (0x{CANON_VID:04x}:0x{pid:04x}) -- unrecognised")
+
+    if storage_mode_hit and not scanner_mode_hit:
+        pid, model = storage_mode_hit
+        print()
+        print(c("   >>> The scanner is in CaptureOnTouch Lite mode. <<<", BOLD))
+        print()
+        print("   In this mode it enumerates as a USB flash drive, macOS's own")
+        print("   storage driver claims the USB interface, and no scanning")
+        print("   software (SANE, VueScan, Image Capture) can reach it.")
+        print()
+        print(c("   Fix -- takes about ten seconds:", BOLD))
+        print("     1. Unplug the scanner's USB cable.")
+        print(f"     2. On the back of the {model}, slide the")
+        print(c("        'Auto Start' switch to OFF.", BOLD))
+        print("     3. Plug the USB cable back in.")
+        print("     4. Run 'p215 doctor' again.")
+        print()
+        print(f"   The USB id should change from 0x{pid:04x} to "
+              f"0x{[k for k, v in SCANNER_MODE.items() if v == model][0]:04x}.")
+        return 1
+
+    # 3. SANE sees it?
+    print(c("\n3. SANE device", BOLD))
+    found = sane_devices()
+    if found:
+        for d in found:
+            print(f"   {c('OK', GREEN)}  {d}")
+        opts, help_text = sane_options(found[0])
+        if opts:
+            sources = option_values(help_text, "--source")
+            print(f"   {len(opts)} options advertised by the backend")
+            if sources:
+                print(f"   sources: {sources.strip()}")
+        print(c("\nReady to scan:", BOLD) + "  p215 scan --out ~/Desktop/scan.pdf")
+        return 0
+
+    print(f"   {c('NOT DETECTED', RED)}  SANE cannot see the scanner")
+    print("       The USB id looks right, so try:")
+    print("         sane-find-scanner -q")
+    print("         SANE_DEBUG_CANON_DR=35 scanimage -L")
+    return 1
+
+
+# --------------------------------------------------------------------------
+# Minimal PDF writer (embeds JPEGs losslessly as DCTDecode)
+# --------------------------------------------------------------------------
+
+def jpeg_info(path):
+    """Return (width, height, components) by parsing the JPEG SOF marker."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:2] != b"\xff\xd8":
+        raise ValueError(f"{path}: not a JPEG")
+    i = 2
+    while i < len(data) - 1:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7 or marker == 0x01:
+            i += 2
+            continue
+        if i + 4 > len(data):
+            break
+        seglen = struct.unpack(">H", data[i + 2:i + 4])[0]
+        # SOF0..SOF15 except DHT(C4), JPG(C8), DAC(CC)
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            h, w = struct.unpack(">HH", data[i + 5:i + 9])
+            ncomp = data[i + 9]
+            return w, h, ncomp
+        i += 2 + seglen
+    raise ValueError(f"{path}: no SOF marker found")
+
+
+def write_pdf(jpegs, out_path, dpi):
+    objects = []          # list of bytes bodies, 1-indexed
+
+    def add(body):
+        objects.append(body)
+        return len(objects)
+
+    catalog_id = add(b"")   # placeholder, filled at end
+    pages_id = add(b"")
+
+    kids = []
+    for jp in jpegs:
+        w, h, ncomp = jpeg_info(jp)
+        with open(jp, "rb") as f:
+            raw = f.read()
+        cs = b"/DeviceRGB" if ncomp == 3 else (b"/DeviceCMYK" if ncomp == 4 else b"/DeviceGray")
+        img_id = add(
+            b"<< /Type /XObject /Subtype /Image /Width " + str(w).encode()
+            + b" /Height " + str(h).encode()
+            + b" /ColorSpace " + cs
+            + b" /BitsPerComponent 8 /Filter /DCTDecode /Length "
+            + str(len(raw)).encode() + b" >>\nstream\n" + raw + b"\nendstream"
+        )
+        pw = w * 72.0 / dpi
+        ph = h * 72.0 / dpi
+        content = f"q {pw:.2f} 0 0 {ph:.2f} 0 0 cm /Im0 Do Q".encode()
+        cont_id = add(
+            b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n"
+            + content + b"\nendstream"
+        )
+        page_id = add(
+            b"<< /Type /Page /Parent " + str(pages_id).encode() + b" 0 R"
+            + f" /MediaBox [0 0 {pw:.2f} {ph:.2f}]".encode()
+            + b" /Resources << /XObject << /Im0 " + str(img_id).encode() + b" 0 R >> >>"
+            + b" /Contents " + str(cont_id).encode() + b" 0 R >>"
+        )
+        kids.append(page_id)
+
+    objects[catalog_id - 1] = (
+        b"<< /Type /Catalog /Pages " + str(pages_id).encode() + b" 0 R >>"
+    )
+    objects[pages_id - 1] = (
+        b"<< /Type /Pages /Count " + str(len(kids)).encode() + b" /Kids ["
+        + b" ".join(str(k).encode() + b" 0 R" for k in kids) + b"] >>"
+    )
+
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0] * (len(objects) + 1)
+    for n, body in enumerate(objects, start=1):
+        offsets[n] = len(out)
+        out += str(n).encode() + b" 0 obj\n" + body + b"\nendobj\n"
+
+    xref_at = len(out)
+    out += b"xref\n0 " + str(len(objects) + 1).encode() + b"\n"
+    out += b"0000000000 65535 f \n"
+    for n in range(1, len(objects) + 1):
+        out += f"{offsets[n]:010d} 00000 n \n".encode()
+    out += (
+        b"trailer\n<< /Size " + str(len(objects) + 1).encode()
+        + b" /Root " + str(catalog_id).encode() + b" 0 R >>\nstartxref\n"
+        + str(xref_at).encode() + b"\n%%EOF\n"
+    )
+
+    with open(out_path, "wb") as f:
+        f.write(out)
+
+
+# --------------------------------------------------------------------------
+# scan
+# --------------------------------------------------------------------------
+
+def cmd_scan(args):
+    devs = sane_devices()
+    if not devs:
+        print(c("No scanner found.", RED), "Run 'p215 doctor' for a diagnosis.", file=sys.stderr)
+        return 1
+    device = args.device or devs[0]
+
+    opts, help_text = sane_options(device)
+    cmd = [SCANIMAGE, "-d", device]
+
+    # --- source / duplex -------------------------------------------------
+    if "--source" in opts:
+        avail = option_values(help_text, "--source")
+        want = "ADF Duplex" if args.duplex else "ADF Front"
+        chosen = None
+        for cand in ([want, "ADF Duplex", "ADF Front", "ADF"] if args.duplex
+                     else [want, "ADF Front", "ADF", "ADF Duplex"]):
+            if cand.lower() in avail.lower():
+                chosen = cand
+                break
+        if chosen:
+            cmd += ["--source", chosen]
+
+    if "--mode" in opts:
+        avail = option_values(help_text, "--mode")
+        want = {"color": "Color", "gray": "Gray", "lineart": "Lineart"}[args.mode]
+        if want.lower() in avail.lower():
+            cmd += ["--mode", want]
+
+    if "--resolution" in opts:
+        cmd += ["--resolution", str(args.dpi)]
+
+    # Quality-of-life options canon_dr exposes; only pass what exists.
+    # Boolean options are declared as --name[=(yes|no)]; scanimage only accepts
+    # them joined with '=', never as two arguments.
+    if args.deskew and "--swdeskew" in opts:
+        cmd += ["--swdeskew=yes"]
+    if args.crop and "--swcrop" in opts:
+        cmd += ["--swcrop=yes"]
+    if args.drop_blank and "--swskip" in opts:
+        # Percentage of dark pixels below which a page counts as blank. A page
+        # of ordinary text only runs 2-3%, so this has to stay low or real
+        # pages get discarded.
+        cmd += ["--swskip", str(args.blank_threshold)]
+    if args.brightness and "--brightness" in opts:
+        cmd += ["--brightness", str(args.brightness)]
+    if args.contrast and "--contrast" in opts:
+        cmd += ["--contrast", str(args.contrast)]
+
+    tmp = tempfile.mkdtemp(prefix="p215-")
+    try:
+        pattern = os.path.join(tmp, "page-%03d.tif")
+        cmd += ["--format", "tiff", "--batch=" + pattern]
+        if args.pages:
+            cmd += [f"--batch-count={args.pages}"]
+
+        print(c("Scanning...", BOLD), " ".join(cmd[1:]) if args.verbose else "")
+        proc = subprocess.run(cmd, capture_output=not args.verbose, text=True)
+        # exit 7 == SANE_STATUS_NO_DOCS, the normal end of an ADF batch
+        if proc.returncode not in (0, 7):
+            err = (proc.stderr or "").strip()
+            print(c(f"scanimage failed (exit {proc.returncode})", RED), file=sys.stderr)
+            if err:
+                print(err, file=sys.stderr)
+            return proc.returncode
+
+        pages = sorted(
+            os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith(".tif")
+        )
+        if not pages:
+            print(c("No pages scanned.", RED), "Is there paper in the feeder?", file=sys.stderr)
+            return 1
+        print(f"  {len(pages)} page(s) captured")
+
+        out = os.path.expanduser(args.out)
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        fmt = args.format or (
+            "pdf" if out.lower().endswith(".pdf") else out.rsplit(".", 1)[-1].lower()
+        )
+
+        if fmt == "pdf":
+            jpegs = []
+            for i, p in enumerate(pages):
+                j = os.path.join(tmp, f"page-{i:03d}.jpg")
+                subprocess.run(
+                    ["sips", "-s", "format", "jpeg", "-s", "formatOptions",
+                     str(args.quality), p, "--out", j],
+                    capture_output=True, check=True,
+                )
+                jpegs.append(j)
+            write_pdf(jpegs, out, args.dpi)
+        elif fmt in ("tif", "tiff"):
+            if len(pages) == 1:
+                shutil.copy(pages[0], out)
+            else:
+                subprocess.run(["tiffcp"] + pages + [out], check=True)
+        else:
+            base, ext = os.path.splitext(out)
+            for i, p in enumerate(pages):
+                dest = out if len(pages) == 1 else f"{base}-{i+1:03d}{ext}"
+                subprocess.run(
+                    ["sips", "-s", "format", fmt, p, "--out", dest],
+                    capture_output=True, check=True,
+                )
+
+        print(c("Saved:", GREEN), out)
+        if args.open:
+            subprocess.run(["open", out])
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="p215",
+        description="Scan with a Canon imageFORMULA P-215/P-215II on macOS.",
+    )
+    sub = ap.add_subparsers(dest="cmd")
+
+    d = sub.add_parser("doctor", help="diagnose scanner mode and SANE setup")
+    d.set_defaults(func=cmd_doctor)
+
+    s = sub.add_parser("scan", help="scan from the ADF")
+    s.add_argument("--out", "-o", default="~/Desktop/scan.pdf",
+                   help="output file (default: ~/Desktop/scan.pdf)")
+    s.add_argument("--dpi", type=int, default=300, help="resolution (default 300)")
+    s.add_argument("--mode", choices=["color", "gray", "lineart"], default="color")
+    s.add_argument("--duplex", action="store_true", default=True,
+                   help="scan both sides (default)")
+    s.add_argument("--simplex", dest="duplex", action="store_false",
+                   help="scan one side only")
+    s.add_argument("--pages", type=int, help="stop after N pages")
+    s.add_argument("--format", choices=["pdf", "tiff", "jpeg", "png"])
+    s.add_argument("--quality", type=int, default=85, help="JPEG quality for PDF (default 85)")
+    s.add_argument("--no-deskew", dest="deskew", action="store_false", default=True)
+    s.add_argument("--no-crop", dest="crop", action="store_false", default=True)
+    s.add_argument("--keep-blank", dest="drop_blank", action="store_false", default=True)
+    s.add_argument("--blank-threshold", type=float, default=0.8,
+                   help="%% dark pixels below which a page is blank (default 0.8)")
+    s.add_argument("--brightness", type=int)
+    s.add_argument("--contrast", type=int)
+    s.add_argument("--device", "-d", help="explicit SANE device name")
+    s.add_argument("--open", action="store_true", help="open the result when done")
+    s.add_argument("--verbose", "-v", action="store_true")
+    s.set_defaults(func=cmd_scan)
+
+    args = ap.parse_args()
+    if not args.cmd:
+        ap.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

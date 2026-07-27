@@ -1,0 +1,26 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app
+        run: cd app && ./build.sh
+
+      - name: Build CLI harness
+        run: cd app && ./build-cli.sh
+
+      - name: Package
+        run: ditto -c -k --keepParent "app/build/P215 Scan.app" "P215.Scan.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: P215-Scan
+          path: P215.Scan.zip

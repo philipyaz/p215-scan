@@ -1,0 +1,21 @@
+# Canon's own software and everything derived from it.
+#
+# reference/ holds Canon binaries moved out of ~/Documents and
+# ~/Library/Application Support, their disassembly, and sample scans of real
+# documents. None of it is redistributable, and the scans are personal mail.
+# The scanner is the master copy — see reference/originals/MANIFEST.md for how
+# to regenerate the lot.
+#
+# The one exception is reference/protocol/ — our own write-up of the wire
+# protocol, in our own words, published for interoperability.
+reference/*
+!reference/protocol/
+
+# Build output
+app/build/
+.build/
+*.o
+*.swiftmodule
+
+# macOS
+.DS_Store
