@@ -29,28 +29,38 @@ export a searchable PDF — in one window instead of a three-step wizard.
 
 ## Install
 
-With [Homebrew](https://brew.sh) (installs the SANE backend too):
+The app is self-contained — the SANE backend that drives the scanner is
+bundled inside, so there is nothing else to install.
+
+No Homebrew needed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/philipyaz/p215-scan/main/install.sh | bash
+```
+
+With [Homebrew](https://brew.sh):
 
 ```bash
 brew install --cask philipyaz/tap/p215-scan
 ```
 
 Or by hand: grab the zip from
-[Releases](https://github.com/philipyaz/p215-scan/releases), drop
-`P215 Scan.app` into `/Applications`, and `brew install sane-backends`.
-Releases are not notarized (there is no paid Apple Developer account behind
-this project). Homebrew 6 installs it ready to launch; if you downloaded the
-zip by hand — or use an older Homebrew, where you can add
-`HOMEBREW_CASK_OPTS=--no-quarantine` — macOS may refuse the first launch
-until you allow it under **System Settings → Privacy & Security → Open
-Anyway**.
+[Releases](https://github.com/philipyaz/p215-scan/releases) and drop
+`P215 Scan.app` into `/Applications`. Releases are not notarized (there is no
+paid Apple Developer account behind this project); the curl and Homebrew
+routes install it ready to launch, but a zip downloaded in a browser is
+quarantined, and macOS will refuse the first launch until you allow it under
+**System Settings → Privacy & Security → Open Anyway**.
 
 Or build from source — it is one `swiftc` invocation, no Xcode project:
 
 ```bash
 git clone https://github.com/philipyaz/p215-scan.git
-cd p215-scan/app && ./build.sh && open "build/P215 Scan.app"
+cd p215-scan/app && ./bundle-sane.sh && ./build.sh && open "build/P215 Scan.app"
 ```
+
+(`bundle-sane.sh` embeds SANE from a Homebrew `sane-backends` install; skip it
+and the app will use the system copy instead.)
 
 ## Setup
 
@@ -209,7 +219,7 @@ app/
   Sources/Snapshot.swift      headless UI screenshots, no permissions needed
   Sources/*View*.swift        SwiftUI interface
   Sources/CLI/main.swift      headless harness
-  build.sh / build-cli.sh / make-icon.sh
+  build.sh / build-cli.sh / make-icon.sh / bundle-sane.sh
 p215                          SANE-based Python CLI
 
 reference/
@@ -248,8 +258,13 @@ money, not a business.
 
 ## License and trademarks
 
-[MIT](LICENSE). Canon, imageFORMULA and CaptureOnTouch are trademarks of Canon
-Inc. This project is not affiliated with, endorsed by, or supported by Canon.
-It contains no Canon code; the hardware protocol was reverse engineered for
+[MIT](LICENSE). Release builds bundle an unmodified copy of
+[sane-backends](https://gitlab.com/sane-project/backends) (GPL-2.0-or-later
+with the SANE exception) and the libraries it uses; their licenses and source
+locations ship inside the app at `Contents/Frameworks/sane/licenses/`.
+
+Canon, imageFORMULA and CaptureOnTouch are trademarks of Canon Inc. This
+project is not affiliated with, endorsed by, or supported by Canon. It
+contains no Canon code; the hardware protocol was reverse engineered for
 interoperability, and Canon's own software is deliberately excluded from this
 repository.

@@ -41,8 +41,34 @@ actor SaneBackend {
         "/usr/bin/scanimage",
     ]
 
+    /// The relocatable SANE copy shipped inside the app (built by
+    /// bundle-sane.sh), so end users need no Homebrew. The second candidate is
+    /// where the CLI harness finds it during development.
+    static var bundledRoot: String? {
+        let candidates = [
+            Bundle.main.bundlePath + "/Contents/Frameworks/sane",
+            Bundle.main.bundlePath + "/sane-bundle",
+        ]
+        return candidates.first {
+            FileManager.default.isExecutableFile(atPath: $0 + "/bin/scanimage")
+        }
+    }
+
+    /// Bundled copy first — deterministic regardless of what Homebrew has.
     static var executable: String? {
-        searchPaths.first { FileManager.default.isExecutableFile(atPath: $0) }
+        if let root = bundledRoot { return root + "/bin/scanimage" }
+        return searchPaths.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    /// Environment for running the bundled copy: SANE_CONFIG_DIR points it at
+    /// the bundled dll.conf, and LD_LIBRARY_PATH is what SANE's dll loader
+    /// (its own path list, not dyld) searches for backend .so files.
+    static func environment(for exe: String) -> [String: String]? {
+        guard let root = bundledRoot, exe.hasPrefix(root) else { return nil }
+        var env = ProcessInfo.processInfo.environment
+        env["SANE_CONFIG_DIR"] = root + "/etc/sane.d"
+        env["LD_LIBRARY_PATH"] = root + "/lib/sane"
+        return env
     }
 
     static var isInstalled: Bool { executable != nil }
@@ -92,6 +118,7 @@ actor SaneBackend {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
+        if let env = environment(for: path) { p.environment = env }
         let out = Pipe(), err = Pipe()
         p.standardOutput = out
         p.standardError = err
@@ -277,6 +304,7 @@ actor SaneBackend {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: exe)
         process.arguments = args
+        if let env = Self.environment(for: exe) { process.environment = env }
         let errPipe = Pipe()
         process.standardError = errPipe
         process.standardOutput = Pipe()

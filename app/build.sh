@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 
 SDK="${SDK:-$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)}"
 TARGET="${TARGET:-arm64-apple-macos14.0}"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-1.1.0}"
 APP="build/P215 Scan.app"
 NAME="P215 Scan"
 
@@ -33,6 +33,13 @@ swiftc \
 echo "==> assembling bundle"
 if [ -f Resources/AppIcon.icns ]; then
     cp Resources/AppIcon.icns "$APP/Contents/Resources/"
+fi
+# Self-contained SANE (see bundle-sane.sh) so users need no Homebrew. Optional:
+# without it the app falls back to a system scanimage.
+if [ -x build/sane-bundle/bin/scanimage ]; then
+    echo "==> bundling SANE"
+    mkdir -p "$APP/Contents/Frameworks"
+    cp -R build/sane-bundle "$APP/Contents/Frameworks/sane"
 fi
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

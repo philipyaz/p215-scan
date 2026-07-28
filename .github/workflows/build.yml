@@ -11,6 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Bundle SANE
+        run: |
+          brew install sane-backends
+          cd app && ./bundle-sane.sh
+
       - name: Build app
         run: cd app && ./build.sh
 
